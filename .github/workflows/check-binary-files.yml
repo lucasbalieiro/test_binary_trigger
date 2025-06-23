@@ -4,6 +4,11 @@ on:
   pull_request:
     branches:
       - main
+
+permissions:
+  issues: write
+  pull-requests: write
+
 jobs:
   binary-change-warning:
     runs-on: ubuntu-latest
@@ -12,41 +17,76 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: Detect binary file changes and new binary files
-      id: detect_changes
+    - name: Detect binary file changes
+      id: detect_binary
       run: |
-        binary_extensions=("*.so" "*.tar.gz" "*.taz.gz" "*.zip" "*.exe" "*.dll" "*.dylib" "*.bin" "*.apk" "*.ipa" "*.deb" "*.rpm" "*.msi")
-        git fetch origin ${{ github.event.pull_request.base.ref }}
-        changed_files=$(git diff --name-only origin/${{ github.event.pull_request.base.ref }}...HEAD)
-        new_files=""
-        binary_changed=false
+        git fetch origin ${{ github.base_ref }}
+        
+        echo "new_files=" >> $GITHUB_ENV
+        echo "binary_changed=false" >> $GITHUB_ENV
+        
+        # Get the list of files with changes (both added/modified and deleted) and check for binaries
+        changed_files=$(git diff --numstat origin/${{ github.base_ref }} | awk '{ if ($1 == "-" && $2 == "-" ) print $3 }')
+        
+        if [ -z "$changed_files" ]; then
+          echo "No binary changes detected."
+          exit 0
+        fi
 
-        for ext in "${binary_extensions[@]}"; do
-          if echo "$changed_files" | grep -qE "${ext//./\\.}$"; then
-            binary_changed=true
-            new_files=$(echo "$changed_files" | grep -E "${ext//./\\.}$")
+        echo "Binary changes detected:"
+        echo "$changed_files"
+        
+        # Track binary files for later use
+        echo "binary_changed=true" >> $GITHUB_ENV
+        {
+          echo "new_files<<EOF"
+          echo "$changed_files"
+          echo "EOF"
+        } >> $GITHUB_ENV
+
+    - name: Check if comment exists and add/edit PR comment
+      if: env.binary_changed == 'true'
+      run: |
+        # Prepare the comment body
+        COMMENT_BODY="### ⚠️ Warning: Binary File Changed or Added! ⚠️\n\n"
+        COMMENT_BODY="${COMMENT_BODY}This PR has modified or added the following binary file(s):\n\n"
+
+        while IFS= read -r file; do
+          COMMENT_BODY="${COMMENT_BODY}- \`${file}\`\n"
+        done <<< "${{ env.new_files }}"
+
+        COMMENT_BODY="${COMMENT_BODY}\nWhile these changes may be intentional, please ensure that a thorough review is conducted to avoid any potential issues or backdoors."
+
+        # Get existing comments from the PR
+        existing_comments=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+          https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments)
+
+        # Check if a comment with the same content already exists
+        comment_id_to_edit=""
+        for comment in $(echo "$existing_comments" | jq -r '.[] | @base64'); do
+          _jq() {
+            echo ${comment} | base64 --decode | jq -r ${1}
+          }
+          
+          # If the comment contains our warning message, save its ID for editing
+          if (_jq '.body' | grep -q "⚠️ Warning: Binary File Changed or Added! ⚠️"); then
+            comment_id_to_edit=$(_jq '.id')
             break
           fi
         done
 
-        echo "binary_changed=$binary_changed" >> $GITHUB_ENV
-        echo "new_files=$new_files" >> $GITHUB_ENV
-
-    - name: Add PR comment if binary files changed or new binaries added
-      if: env.binary_changed == 'true'
-      run: |
-        COMMENT_BODY="### ⚠️ Warning: Binary File Changed or Added! ⚠️\n\n"
-
-        # Add information about the modified or newly added binary file(s)
-        COMMENT_BODY="${COMMENT_BODY}This PR has modified or added the following binary file(s):\n\n"
-        for file in $(echo $new_files | tr ' ' '\n'); do
-          COMMENT_BODY="${COMMENT_BODY}- \`$file\`\n"
-        done
-
-        COMMENT_BODY="${COMMENT_BODY}\nWhile these changes may be intentional, please ensure that a thorough review is conducted to avoid any potential issues or backdoors."
-
-        # Post the comment on the PR
-        curl -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-          -X POST \
-          -d "{\"body\": \"$COMMENT_BODY\"}" \
-          https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments
+        if [ -z "$comment_id_to_edit" ]; then
+          # No existing comment, create a new one
+          echo "No existing comment found. Posting a new comment."
+          curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -X POST \
+            -d "{\"body\": \"$COMMENT_BODY\"}" \
+            https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments
+        else
+          # Comment exists, update it
+          echo "Found existing comment. Editing it."
+          curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -X PATCH \
+            -d "{\"body\": \"$COMMENT_BODY\"}" \
+            https://api.github.com/repos/${{ github.repository }}/issues/comments/${comment_id_to_edit}
+        fi
