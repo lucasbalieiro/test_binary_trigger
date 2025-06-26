@@ -1,7 +1,7 @@
 name: Binary File Change and New Binary Detection Example Repo
 
 on:
-  push:
+  pull_request:
     branches:
       - main
 
